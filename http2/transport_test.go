@@ -5918,3 +5918,45 @@ func TestTransportSlowWrites(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+// TestTransportDoNotHangOnZeroMaxFrameSize verifies that the Transport rejects
+// a SETTINGS frame carrying an invalid SETTINGS_MAX_FRAME_SIZE (0) instead of
+// hanging. See https://go.dev/issue/78476 and CVE-2026-33814.
+func TestTransportDoNotHangOnZeroMaxFrameSize(t *testing.T) {
+	ct := newClientTester(t)
+	ct.client = func() error {
+		defer ct.cc.(*net.TCPConn).CloseWrite()
+		req, _ := http.NewRequest("POST", "https://dummy.tld/", strings.NewReader("body"))
+		// Previously, an invalid SETTINGS_MAX_FRAME_SIZE caused an infinite hang here.
+		_, err := ct.tr.RoundTrip(req)
+		if err == nil {
+			return fmt.Errorf("RoundTrip succeeded; want error due to invalid SETTINGS_MAX_FRAME_SIZE")
+		}
+		return nil
+	}
+	ct.server = func() error {
+		// Read the client preface and SETTINGS frame.
+		buf := make([]byte, len(ClientPreface))
+		if _, err := io.ReadFull(ct.sc, buf); err != nil {
+			return fmt.Errorf("reading client preface: %v", err)
+		}
+		f, err := ct.fr.ReadFrame()
+		if err != nil {
+			return fmt.Errorf("reading client settings frame: %v", err)
+		}
+		if _, ok := f.(*SettingsFrame); !ok {
+			return fmt.Errorf("wanted client settings frame; got %v", f)
+		}
+		// Send a SETTINGS frame with an invalid MAX_FRAME_SIZE of 0.
+		if err := ct.fr.WriteSettings(Setting{ID: SettingMaxFrameSize, Val: 0}); err != nil {
+			return fmt.Errorf("writing settings: %v", err)
+		}
+		// Drain remaining frames until the client closes the connection.
+		for {
+			if _, err := ct.fr.ReadFrame(); err != nil {
+				return nil
+			}
+		}
+	}
+	ct.run()
+}
